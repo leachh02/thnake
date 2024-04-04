@@ -54,6 +54,27 @@
  *
  */
 
+/******************************************************************************
+ * States:
+ * 1 - Initial State
+ * 2 - Active Game State
+ *
+ * Tasks:
+ * 1 Screen
+ *   - If state is init, show intro page
+ *   - Else update snake's pos
+ * 2 Button handler
+ *   - Determines direction of snake
+ *
+ * Timer:
+ * A timer Interrupt wil go off every second and will:
+ * 1 Adjust the snake's pos
+ * 2 Check for end game scenarios, these being:
+ *   - The snake has reached the apple
+ *   - The snake has hit a wall
+ *
+ */
+
 /* Standard includes. */
 #include <stdio.h>
 #include <stdint.h>
@@ -83,6 +104,34 @@
 #include "drivers/Kentec320x240x16_ssd2119_spi.h"
 #include "drivers/touch.h"
 
+/*
+ * Game Specific MACROS.
+ */
+#define INITIAL_STATE 0
+#define ACTIVE_STATE 1
+
+#define SNAKE_UP 0
+#define SNAKE_RIGHT 1
+#define SNAKE_DOWN 2
+#define SNAKE_LEFT 3
+
+#define BLOCK_SIZE 10
+
+#define GAME_ARENA_LOWER_X 0
+#define GAME_ARENA_UPPER_X 320
+#define GAME_ARENA_LOWER_Y 30
+#define GAME_ARENA_UPPER_Y 240
+
+#define SNAKE_INIT_POS_LOWER_X 14
+#define SNAKE_INIT_POS_UPPER_X 19
+#define SNAKE_INIT_POS_LOWER_Y 12
+#define SNAKE_INIT_POS_UPPER_Y 16
+
+#define APPLE_INIT_POS_LOWER_X 0
+#define APPLE_INIT_POS_UPPER_X 31
+#define APPLE_INIT_POS_LOWER_Y 3
+#define APPLE_INIT_POS_UPPER_Y 20
+
 /*-----------------------------------------------------------*/
 /*
  * Time stamp global variable.
@@ -100,11 +149,33 @@ volatile static uint32_t g_pui32ButtonPressed = NULL;
 extern SemaphoreHandle_t xButtonSemaphore;
 
 /*
- * data structures for the graphics library
+ * Data structures for the graphics library.
  */
 tContext sContext;
 tRectangle sRect;
 uint32_t g_ui32SysClock;
+
+/*
+ * State.
+ */
+volatile uint16_t g_gameState = 0;
+
+/*
+ * Snake Direction.
+ */
+volatile uint8_t g_ui8SnakeDir = 0;
+
+/*
+ * Snake position.
+ */
+volatile uint16_t g_snakePosX;
+volatile uint16_t g_snakePosY;
+
+/*
+ * Apple position.
+ */
+volatile uint16_t g_applePosX;
+volatile uint16_t g_applePosY;
 
 /*
  * The tasks as described in the comments at the top of this file.
@@ -112,15 +183,15 @@ uint32_t g_ui32SysClock;
 static void prvProcessSwitchInputTask(void *pvParameters);
 
 /*
+ * The tasks is to handle the display (using grlib).
+ */
+static void prvProcessDisplayTask(void *pvParameters);
+
+/*
  * Called by main() to do example specific hardware configurations and to
  * create the Process Switch task.
  */
 void vLEDTask(void);
-
-/*
- * Hardware configuration for the LEDs.
- */
-static void prvConfigureLED(void);
 
 /*
  * Timer configuration
@@ -135,9 +206,6 @@ static void prvConfigureButton(void);
 
 void vLEDTask(void)
 {
-    /* Light the initial LED. */
-    prvConfigureLED();
-
     /* Configure the button to generate interrupts. */
     prvConfigureButton();
 
@@ -155,7 +223,14 @@ void vLEDTask(void)
      *  - The priority assigned to the task.
      *  - The task handle is not required, so NULL is passed. */
     xTaskCreate(prvProcessSwitchInputTask,
-                "LED",
+                "SWX",
+                configMINIMAL_STACK_SIZE,
+                NULL,
+                tskIDLE_PRIORITY + 1,
+                NULL);
+
+    xTaskCreate(prvProcessDisplayTask,
+                "DIS",
                 configMINIMAL_STACK_SIZE,
                 NULL,
                 tskIDLE_PRIORITY + 1,
@@ -174,8 +249,8 @@ static void prvConfigureHWTimer(void)
     /* Configure Timer 0 in full-width periodic mode. */
     TimerConfigure(TIMER0_BASE, TIMER_CFG_PERIODIC);
 
-    /* Set the Timer 0A load value to run at 5 Hz. */
-    TimerLoadSet(TIMER0_BASE, TIMER_A, configCPU_CLOCK_HZ / 5);
+    /* Set the Timer 0A load value to run at 1 Hz (1 second). */
+    TimerLoadSet(TIMER0_BASE, TIMER_A, configCPU_CLOCK_HZ);
 
     /* Configure the Timer 0A interrupt for timeout. */
     TimerIntEnable(TIMER0_BASE, TIMER_TIMA_TIMEOUT);
@@ -195,15 +270,86 @@ void xTimerHandler(void)
     /* Clear the hardware interrupt flag for Timer 0A. */
     TimerIntClear(TIMER0_BASE, TIMER_TIMA_TIMEOUT);
 
-    /* Move snake position forward every second */
+    switch (g_gameState)
+    {
+    case INITIAL_STATE:
+        break;
+    case ACTIVE_STATE:
+        /* Move snake position forward every second */
+        switch (g_ui8SnakeDir)
+        {
+        case SNAKE_UP:
+            g_snakePosY = g_snakePosY - BLOCK_SIZE;
+            break;
+        case SNAKE_RIGHT:
+            g_snakePosX = g_snakePosX + BLOCK_SIZE;
+            break;
+        case SNAKE_DOWN:
+            g_snakePosY = g_snakePosY + BLOCK_SIZE;
+            break;
+        case SNAKE_LEFT:
+            g_snakePosX = g_snakePosX - BLOCK_SIZE;
+            break;
+        }
+        if ((g_snakePosX == g_applePosX && g_snakePosY == g_applePosY) || g_snakePosX < GAME_ARENA_LOWER_X || g_snakePosX >= GAME_ARENA_UPPER_X || g_snakePosY < GAME_ARENA_LOWER_Y || g_snakePosY >= GAME_ARENA_UPPER_Y)
+        {
+            g_gameState = INITIAL_STATE;
+        }
+        break;
+    }
 }
 
 /*-----------------------------------------------------------*/
 
 static void prvProcessSwitchInputTask(void *pvParameters)
 {
-    uint8_t ui8LEDIndex = 0;
+    for (;;)
+    {
+        /* Block until the ISR gives the semaphore. */
+        if (xSemaphoreTake(xButtonSemaphore, portMAX_DELAY) == pdPASS)
+        {
+            switch (g_gameState)
+            {
+            case INITIAL_STATE:
+                g_gameState = ACTIVE_STATE;
+                break;
+            case ACTIVE_STATE:
+                /* If the right button is hit, either increment by 1 or reset the
+                 * index to 0 if it is at 3. */
+                if (g_pui32ButtonPressed == USR_SW1)
+                {
+                    if (g_ui8SnakeDir == SNAKE_LEFT)
+                    {
+                        g_ui8SnakeDir = SNAKE_UP;
+                    }
+                    else
+                    {
+                        g_ui8SnakeDir++;
+                    }
+                }
+                /* If the left button is hit, either decrement by 1 or reset the
+                 * index to 3 if it is at 0. */
+                else if (g_pui32ButtonPressed == USR_SW2)
+                {
+                    if (g_ui8SnakeDir == SNAKE_UP)
+                    {
+                        g_ui8SnakeDir = SNAKE_LEFT;
+                    }
+                    else
+                    {
+                        g_ui8SnakeDir--;
+                    }
+                }
 
+                break;
+            }
+        }
+    }
+}
+/*-----------------------------------------------------------*/
+
+static void prvProcessDisplayTask(void *pvParameters)
+{
     /* Initialise the screen */
 
     //
@@ -233,7 +379,7 @@ static void prvProcessSwitchInputTask(void *pvParameters)
     sRect.i16XMin = 0;
     sRect.i16YMin = 0;
     sRect.i16XMax = GrContextDpyWidthGet(&sContext) - 1;
-    sRect.i16YMax = 23;
+    sRect.i16YMax = 30;
     GrContextForegroundSet(&sContext, ClrDarkBlue);
     GrRectFill(&sContext, &sRect);
 
@@ -247,131 +393,112 @@ static void prvProcessSwitchInputTask(void *pvParameters)
     // Put the application name in the middle of the banner.
     //
     GrContextFontSet(&sContext, &g_sFontCm20);
-    GrStringDrawCentered(&sContext, "snake", -1,
-                         GrContextDpyWidthGet(&sContext) / 2, 8, 0);
+    GrStringDrawCentered(&sContext, "SNAKE", -1,
+                         GrContextDpyWidthGet(&sContext) / 2, 12, 0);
     GrContextForegroundSet(&sContext, ClrBlack);
-
-    //
-    // Put a white box below the banner.
-    //
-    sRect.i16XMin = 0;
-    sRect.i16YMin = 24;
-    sRect.i16XMax = GrContextDpyWidthGet(&sContext) - 1;
-    sRect.i16YMax = GrContextDpyHeightGet(&sContext) - 1;
-    GrContextForegroundSet(&sContext, ClrWhite);
-    GrRectFill(&sContext, &sRect);
-
-    //
-    // Instructions.
-    //
-    GrContextForegroundSet(&sContext, ClrBlack);
-    GrContextFontSet(&sContext, &g_sFontCm14);
-    GrStringDrawCentered(&sContext,
-                         "1. Press start/stop button to begin stopwatch.", -1,
-                         GrContextDpyWidthGet(&sContext) / 2, 32, 0);
-    GrStringDrawCentered(&sContext,
-                         "2. Press again to pause the stopwatch.", -1,
-                         GrContextDpyWidthGet(&sContext) / 2, 48, 0);
-    GrStringDrawCentered(&sContext,
-                         "a) The reset button reverts the system.", -1,
-                         GrContextDpyWidthGet(&sContext) / 2, 64, 0);
-    GrStringDrawCentered(&sContext,
-                         "b) Pressing the button continues the timer.", -1,
-                         GrContextDpyWidthGet(&sContext) / 2, 80, 0);
-    GrStringDrawCentered(&sContext,
-                         "3. The stopwatch becomes inactive after 60 seconds.", -1,
-                         GrContextDpyWidthGet(&sContext) / 2, 96, 0);
-
-    char display_string[20] = "LED x";
-
+    bool stateZeroFlag = true;
     for (;;)
     {
-        /* Block until the ISR gives the semaphore. */
-        if (xSemaphoreTake(xButtonSemaphore, portMAX_DELAY) == pdPASS)
+        switch (g_gameState)
         {
-            /* If the right button is hit, either increment by 1 or reset the
-             * index to 0 if it is at 3. */
-            if (g_pui32ButtonPressed == USR_SW1)
+        case INITIAL_STATE:
+            if (stateZeroFlag)
             {
-                if (ui8LEDIndex == 3)
-                {
-                    ui8LEDIndex = 0;
-                }
-                else
-                {
-                    ui8LEDIndex++;
-                }
+                //
+                // Put a white box below the banner.
+                //
+                sRect.i16XMin = GAME_ARENA_LOWER_X;
+                sRect.i16YMin = GAME_ARENA_LOWER_Y;
+                sRect.i16XMax = GrContextDpyWidthGet(&sContext) - 1;
+                sRect.i16YMax = GrContextDpyHeightGet(&sContext) - 1;
+                GrContextForegroundSet(&sContext, ClrWhite);
+                GrRectFill(&sContext, &sRect);
+                //
+                // Instructions.
+                //
+                GrContextForegroundSet(&sContext, ClrBlack);
+                GrContextFontSet(&sContext, &g_sFontCm14);
+                GrStringDrawCentered(&sContext,
+                                     "1. Press SW1 or SW2 to begin.", -1,
+                                     GrContextDpyWidthGet(&sContext) / 2, 42, 0);
+                GrStringDrawCentered(&sContext,
+                                     "2. Press SW1 to turn clockwise.", -1,
+                                     GrContextDpyWidthGet(&sContext) / 2, 58, 0);
+                GrStringDrawCentered(&sContext,
+                                     "3. Press SW2 to turn anti-clockwise.", -1,
+                                     GrContextDpyWidthGet(&sContext) / 2, 74, 0);
+                GrStringDrawCentered(&sContext,
+                                     "4. Try to eat the red apple!", -1,
+                                     GrContextDpyWidthGet(&sContext) / 2, 90, 0);
+                GrStringDrawCentered(&sContext,
+                                     "5. Avoid the walls...", -1,
+                                     GrContextDpyWidthGet(&sContext) / 2, 106, 0);
             }
-            /* If the left button is hit, either decrement by 1 or reset the
-             * index to 3 if it is at 0. */
-            else if (g_pui32ButtonPressed == USR_SW2)
-            {
-                if (ui8LEDIndex == 0)
-                {
-                    ui8LEDIndex = 3;
-                }
-                else
-                {
-                    ui8LEDIndex--;
-                }
-            }
-
-            /* Turn off all LED's. */
-            LEDWrite(LED_D1 | LED_D2 | LED_D3 | LED_D4, 0);
-
-            /* Set the LED based on the updated Index. */
-            switch (ui8LEDIndex)
-            {
-            case 0:
-                LEDWrite(LED_D1, LED_D1);
-                display_string[4] = '0';
-                break;
-            case 1:
-                LEDWrite(LED_D2, LED_D2);
-                display_string[4] = '1';
-                break;
-            case 2:
-                LEDWrite(LED_D3, LED_D3);
-                display_string[4] = '2';
-                break;
-            case 3:
-                LEDWrite(LED_D4, LED_D4);
-                display_string[4] = '3';
-                break;
-            }
-
+            stateZeroFlag = false;
+            break;
+        case ACTIVE_STATE:
+            stateZeroFlag = true;
             //
-            // Fill the top 24 rows of the screen with blue to create the banner.
+            // Put a smokey white box below the banner.
             //
-            sRect.i16XMin = 0;
-            sRect.i16YMin = 0;
+            sRect.i16XMin = GAME_ARENA_LOWER_X;
+            sRect.i16YMin = GAME_ARENA_LOWER_Y;
             sRect.i16XMax = GrContextDpyWidthGet(&sContext) - 1;
-            sRect.i16YMax = 23;
-            GrContextForegroundSet(&sContext, ClrDarkBlue);
+            sRect.i16YMax = GrContextDpyHeightGet(&sContext) - 1;
+            GrContextForegroundSet(&sContext, ClrWhiteSmoke);
             GrRectFill(&sContext, &sRect);
-
             //
             // Put a white box around the banner.
             //
             GrContextForegroundSet(&sContext, ClrWhite);
             GrRectDraw(&sContext, &sRect);
 
-            /*
-            Update the display string based on which LED is on
-            */
-            GrContextFontSet(&sContext, &g_sFontCm20);
-            GrStringDrawCentered(&sContext, display_string, -1, GrContextDpyWidthGet(&sContext) / 2, 8, 0);
+            // game size will be 32x21 (disp height is 240 but subtract 30px for banner)
+            // Calc snake init pos (upper & lower bounds are set above as MACROS for snake starting pos)
+            uint16_t snakeInitPosX = ((rand() % (SNAKE_INIT_POS_UPPER_X - SNAKE_INIT_POS_LOWER_X + 1)) + SNAKE_INIT_POS_LOWER_X) * BLOCK_SIZE;
+            uint16_t snakeInitPosY = ((rand() % (SNAKE_INIT_POS_UPPER_Y - SNAKE_INIT_POS_LOWER_Y + 1)) + SNAKE_INIT_POS_LOWER_Y) * BLOCK_SIZE;
+            g_snakePosX = snakeInitPosX;
+            g_snakePosY = snakeInitPosY;
+
+            // Calc apple init pos (upper & lower bounds are set above as MACROS for apple starting pos)
+            uint16_t xStartApple = ((rand() % (APPLE_INIT_POS_UPPER_X - APPLE_INIT_POS_LOWER_X + 1)) + APPLE_INIT_POS_LOWER_X) * BLOCK_SIZE;
+            uint16_t yStartApple = ((rand() % (APPLE_INIT_POS_UPPER_Y - APPLE_INIT_POS_LOWER_Y + 1)) + APPLE_INIT_POS_LOWER_Y) * BLOCK_SIZE;
+            while ((xStartApple >= snakeInitPosX && xStartApple <= snakeInitPosX + BLOCK_SIZE) ||
+                   (yStartApple >= snakeInitPosY && yStartApple <= snakeInitPosY + BLOCK_SIZE))
+            {
+                // Calc apple init pos
+                xStartApple = ((rand() % (APPLE_INIT_POS_UPPER_X - APPLE_INIT_POS_LOWER_X + 1)) + APPLE_INIT_POS_LOWER_X) * BLOCK_SIZE;
+                yStartApple = ((rand() % (APPLE_INIT_POS_UPPER_Y - APPLE_INIT_POS_LOWER_Y + 1)) + APPLE_INIT_POS_LOWER_Y) * BLOCK_SIZE;
+            }
+            g_applePosX = xStartApple;
+            g_applePosY = yStartApple;
+            //
+            // Init apple (10x10) red block
+            //
+            sRect.i16XMin = g_applePosX;
+            sRect.i16YMin = g_applePosY;
+            sRect.i16XMax = g_applePosX + BLOCK_SIZE;
+            sRect.i16YMax = g_applePosY + BLOCK_SIZE;
+            GrContextForegroundSet(&sContext, ClrRed);
+            GrRectFill(&sContext, &sRect);
+
+            while (g_gameState == ACTIVE_STATE)
+            {
+                //
+                // Snake (10x10) green block
+                //
+                sRect.i16XMin = g_snakePosX;
+                sRect.i16YMin = g_snakePosY;
+                sRect.i16XMax = g_snakePosX + BLOCK_SIZE;
+                sRect.i16YMax = g_snakePosY + BLOCK_SIZE;
+                GrContextForegroundSet(&sContext, ClrGreen);
+                GrRectFill(&sContext, &sRect);
+            }
+            break;
         }
     }
 }
-/*-----------------------------------------------------------*/
 
-static void prvConfigureLED(void)
-{
-    /* Configure initial LED state.  PinoutSet() has already configured
-     * LED I/O. */
-    LEDWrite(LED_D1, LED_D1);
-}
 /*-----------------------------------------------------------*/
 
 static void prvConfigureButton(void)
